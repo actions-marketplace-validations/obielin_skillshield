@@ -1,12 +1,18 @@
 # SkillShield
 
-Security scanner for AI agent skills. It looks for prompt injection, data exfiltration and malicious payloads in a skill before you install it.
+Security scanner for AI agent skills. It looks for known prompt-injection, data-exfiltration and malicious-payload patterns in a skill before you install it.
 
-[![Tests](https://img.shields.io/badge/Tests-152%20passing-brightgreen?style=flat-square)](tests/)
+SkillShield is a first line of defence, not a complete one: see [Limitations](#limitations) and the [roadmap](ROADMAP.md).
+
+**Contributors welcome.** Pick an issue and comment `/assign` to claim it: [good first issues](https://github.com/obielin/skillshield/contribute) · [help wanted](https://github.com/obielin/skillshield/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22) · [detection gaps](https://github.com/obielin/skillshield/issues?q=is%3Aissue+is%3Aopen+label%3Adetection-gap) · [roadmap](ROADMAP.md)
+
+[![Tests](https://img.shields.io/badge/Tests-162%20passing-brightgreen?style=flat-square)](tests/)
 [![PyPI](https://img.shields.io/pypi/v/skillshield?style=flat-square)](https://pypi.org/project/skillshield/)
 [![Dependencies](https://img.shields.io/badge/Dependencies-zero-brightgreen?style=flat-square)](pyproject.toml)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=flat-square)](pyproject.toml)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
+[![Good first issues](https://img.shields.io/github/issues/obielin/skillshield/good%20first%20issue?style=flat-square&label=good%20first%20issues)](https://github.com/obielin/skillshield/contribute)
+[![Help wanted](https://img.shields.io/github/issues/obielin/skillshield/help%20wanted?style=flat-square&label=help%20wanted)](https://github.com/obielin/skillshield/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22)
 [![LinkedIn](https://img.shields.io/badge/-Linda_Oraegbunam-blue?logo=linkedin&style=flat-square)](https://www.linkedin.com/in/linda-oraegbunam/)
 
 ---
@@ -260,6 +266,7 @@ The risk level comes from the findings and the score:
 SkillShield matches known patterns. It is a first line of defence, not a guarantee:
 
 - **Reworded attacks can get through.** A rule that catches "ignore all previous instructions" may miss the same instruction said another way.
+- **Only English phrasing is matched.** The same instruction in French or Spanish is not flagged yet (#66), and rewording it also switches off the lethal-trifecta rule (#67).
 - **Hidden characters are not yet removed before matching.** Zero-width characters inside a word, or lookalike letters from other alphabets, can stop a rule from matching.
 - **Some techniques have no rule yet**, such as piping a downloaded script into a shell, leaking data through a markdown image URL, or an instruction that waits for a trigger word.
 - **Documentation about attacks can be flagged.** A guide that quotes an attack phrase as an example may be reported as if it were an attack.
@@ -515,12 +522,7 @@ print([f.rule_id for f in defaults_plus_mine.scan_text(text).findings])
 
 ## Roadmap
 
-- [ ] LLM-judge pass for semantic prompt injection (catches paraphrased attacks)
-- [x] SARIF output format for GitHub Advanced Security integration
-- [x] GitHub Action (`uses: obielin/skillshield@v1`)
-- [ ] `awesome-skills` watchlist auto-scan (daily scan of top-100 starred skills)
-- [ ] VS Code extension
-- [ ] Pre-commit hook
+[ROADMAP.md](ROADMAP.md) sets out how SkillShield goes from a pattern scanner to a layered defence: measuring detection and false positives, closing evasions, judging what a skill does rather than how it is worded, an optional local semantic check, locking reviewed skills, and a runtime guard. Each stage has a tracking issue.
 
 ---
 

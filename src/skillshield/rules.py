@@ -7,9 +7,12 @@ Zero external dependencies -- pure Python stdlib.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Callable
+from urllib.parse import urlparse
 
 
 class Severity(str, Enum):
@@ -258,6 +261,9 @@ RULE_SCOPE_CREEP = Rule(
 # ── SG-008: Obfuscation ────────────────────────────────────────
 
 
+_BIDI_CONTROL_RE = re.compile("[\u202a-\u202e\u2066-\u2069]")
+
+
 def _check_obfuscation(text: str) -> list[str]:
     matches = []
     # Base64 encoded blocks (>100 chars of b64 chars)
@@ -280,6 +286,24 @@ def _check_obfuscation(text: str) -> list[str]:
     for m in rot_re.finditer(text):
         matches.append(m.group(0))
 
+    # Bidirectional control characters reorder displayed text (Trojan Source,
+    # CVE-2021-42574). Plain Arabic or Hebrew text does not need them.
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        found = _BIDI_CONTROL_RE.findall(line)
+        if not found:
+            continue
+        # Cut a window around the first control character before escaping it,
+        # so a long line cannot push the marker out of the excerpt.
+        line = line.strip()
+        first = _BIDI_CONTROL_RE.search(line).start()
+        start = max(0, first - 60)
+        window = line[start : start + 100]
+        shown = _BIDI_CONTROL_RE.sub(lambda m: f"<U+{ord(m.group(0)):04X}>", window)
+        if start:
+            shown = "..." + shown
+        names = ", ".join(f"U+{ord(c):04X} {unicodedata.name(c)}" for c in dict.fromkeys(found))
+        matches.append(f"{shown} [line {lineno}: {names}]")
+
     return matches
 
 
@@ -290,11 +314,17 @@ RULE_OBFUSCATION = Rule(
     description=(
         "The skill contains heavily obfuscated content -- base64 blobs, hex encoding, "
         "or unicode escape sequences that conceal the actual instructions from "
-        "human reviewers. Snyk found obfuscation in 23% of flagged ToxicSkills."
+        "human reviewers. Snyk found obfuscation in 23% of flagged ToxicSkills. "
+        "Bidirectional control characters (U+202A-U+202E, U+2066-U+2069) make text "
+        "display in a different order from how it is stored, so a reviewer reads "
+        "something other than what the model reads (Trojan Source, CVE-2021-42574, "
+        "Boucher and Anderson)."
     ),
     remediation=(
         "All skill instructions must be human-readable. Obfuscated content "
-        "should be decoded and audited, or the skill should be rejected."
+        "should be decoded and audited, or the skill should be rejected. Remove "
+        "any bidirectional control characters; ordinary Arabic and Hebrew text "
+        "does not need them."
     ),
     check_fn=_check_obfuscation,
     tags=["obfuscation", "evasion", "supply-chain"],
@@ -453,6 +483,415 @@ RULE_SUSPICIOUS_URLS = Rule(
 )
 
 
+# ── SG-013: Untrusted Package Registry ───────────────────────
+
+# Hosts of the official package registries. An install that points anywhere
+# else is a supply-chain attack (dependency confusion / registry hijack).
+# TestPyPI is not listed: it is a separate index that anyone can upload to,
+# so an install pointed there is an override like any other. GitHub Packages
+# (npm.pkg.github.com) is not listed either: it is a separate registry that
+# needs its own namespace and authentication for a later install.
+_OFFICIAL_REGISTRY_HOSTS = {
+    "pypi.org",
+    "files.pythonhosted.org",
+    "pypi.python.org",
+    "registry.npmjs.org",
+    "registry.yarnpkg.com",
+}
+
+# Official-looking hosts that hold a separate index, so an install pointed
+# there is an override: TestPyPI has its own database and anyone can publish
+# to it.
+_UNTRUSTED_REGISTRY_HOSTS = {"test.pypi.org"}
+
+# Every whitespace run here is [ \t] rather than \s: \s matches newlines, so a
+# pattern anchored with ^ would rescan the rest of the file from each blank
+# line, and 100,000 blank lines would stall a scan.
+_REGISTRY_URL_PATTERNS = [
+    r"(?:--index-url|--extra-index-url)[ \t]*[= \t][ \t]*['\"]?(https?://[^\s'\"`]+)",
+    r"pip[ \t]+config[ \t]+set[ \t]+\S*index-url[ \t]+['\"]?(https?://[^\s'\"`]+)",
+    r"PIP_(?:EXTRA_)?INDEX_URL[ \t]*=[ \t]*['\"]?(https?://[^\s'\"`]+)",
+    r"npm[ \t]+config[ \t]+set[ \t]+(?:[^\s:]+:)?registry[ \t]+['\"]?(https?://[^\s'\"`]+)",
+    r"--registry[ \t]*[= \t][ \t]*['\"]?(https?://[^\s'\"`]+)",
+    r"yarn[ \t]+config[ \t]+set[ \t]+(?:npmScopes\.[^ \t]+\.)?npmRegistryServer[ \t]+['\"]?(https?://[^\s'\"`]+)",
+]
+
+# pip's short flag is a single letter, so it only overrides the registry on a
+# pip install command; "curl -i" and "grep -i" take the same flag and are
+# clean. A shell separator ends the command, so the scan stops there instead
+# of running to the end of the line and picking up a later "curl -i".
+_PIP_INSTALL = re.compile(r"\bpip3?[ \t]+install\b", re.IGNORECASE)
+_PIP_SHORT_I = re.compile(r"(?:^|[ \t])-i[ \t]*(?:=[ \t]*)?['\"]?(https?://[^\s'\"`]+)")
+_SHELL_SEPARATORS = ";|&\n"
+
+
+def _pip_short_flag_matches(text: str) -> list[tuple[str, str]]:
+    """Return (snippet, url) for every "pip install -i" registry override."""
+    matches: list[tuple[str, str]] = []
+    # Walk each line once and cut it into commands, so a line with many
+    # "pip install" tokens is still scanned in linear time.
+    for line in text.splitlines(keepends=True):
+        start = 0
+        for index, char in enumerate(line):
+            if char not in _SHELL_SEPARATORS:
+                continue
+            matches.extend(_command_pip_short_flag_matches(line[start:index]))
+            start = index + 1
+        matches.extend(_command_pip_short_flag_matches(line[start:]))
+    return matches
+
+
+def _command_pip_short_flag_matches(command: str) -> list[tuple[str, str]]:
+    """Return the "-i" registry overrides of one shell command."""
+    install = _PIP_INSTALL.search(command)
+    if install is None:
+        return []
+    return [
+        (match.group(0).strip(), match.group(1))
+        for match in _PIP_SHORT_I.finditer(command, install.end())
+    ]
+
+
+def _is_official_registry(url: str) -> bool:
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        # urlparse rejects some URLs outright, such as an unclosed IPv6 bracket.
+        # Such a host is not the official registry, and it must not abort the
+        # whole check: the other registry overrides in the file still count.
+        return False
+    if host in _UNTRUSTED_REGISTRY_HOSTS:
+        return False
+    return host in _OFFICIAL_REGISTRY_HOSTS or any(
+        host.endswith("." + official) for official in _OFFICIAL_REGISTRY_HOSTS
+    )
+
+
+def _check_untrusted_registry(text: str) -> list[str]:
+    hits: list[str] = []
+    for pattern in _REGISTRY_URL_PATTERNS:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            if not _is_official_registry(match.group(1)):
+                hits.append(match.group(0).strip())
+
+    # A pip.conf / .npmrc / .pypirc line that sets the registry directly
+    # (index-url = ..., registry=..., npmRegistryServer: ...). This catches the
+    # config-file route without tripping on a documentation link.
+    for snippet, url in _pip_short_flag_matches(text):
+        if not _is_official_registry(url):
+            hits.append(snippet)
+
+    ini_pattern = (
+        r"(?im)^[ \t]*(?:(?:@[^ \t:\r\n]+:)?registry|index[-_]url|extra[-_]index[-_]url|npmRegistryServer)"
+        r"[ \t]*[:=][ \t]*['\"]?(https?://[^\s'\"`]+)"
+    )
+    for match in re.finditer(ini_pattern, text):
+        if not _is_official_registry(match.group(1)):
+            hits.append(match.group(0).strip())
+
+    # .pypirc sets its upload target as "repository = ..." or, as twine also
+    # accepts, "repository: ...". Only an assignment inside a [section] is a
+    # registry override, so a documentation line such as
+    # "Repository: https://github.com/example/project" (outside any section) does
+    # not match.
+    pypirc_sections = {"distutils", "pypi", "testpypi", "server-login"}
+    current_section: str | None = None
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            name = stripped[1:-1].strip().lower()
+            current_section = name if name in pypirc_sections else None
+            continue
+        if current_section is None:
+            continue
+        match = re.match(
+            r"(?i)^[ \t]*repository[ \t]*[:=][ \t]*['\"]?(https?://[^\s'\"`]+)",
+            raw_line,
+        )
+        if match and not _is_official_registry(match.group(1)):
+            hits.append(match.group(0).strip())
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for hit in hits:
+        if hit in seen:
+            continue
+        seen.add(hit)
+        unique.append(hit)
+    return unique
+
+
+RULE_PACKAGE_REGISTRY = Rule(
+    id="SG-013",
+    name="Untrusted Package Registry",
+    severity=Severity.HIGH,
+    description=(
+        "The skill points pip, npm or yarn at a package registry other than the "
+        "official one (--index-url, --registry, npm/yarn config, or a pip.conf, "
+        ".npmrc or .pypirc override). A later install then pulls the attacker's "
+        "packages -- dependency confusion / supply-chain compromise (OWASP AST02). "
+        "Trail of Bits reported this bypass in the CSA review of skill scanners."
+    ),
+    remediation=(
+        "Install from the official registries only: pypi.org for pip and "
+        "registry.npmjs.org for npm. Remove --index-url, --extra-index-url, "
+        "-i, --registry and npm/yarn config overrides, and remove registry lines "
+        "from pip.conf, .npmrc or .pypirc that point anywhere else."
+    ),
+    check_fn=_check_untrusted_registry,
+    tags=["registry", "supply-chain", "dependency-confusion", "owasp-ast02"],
+)
+
+
+# ── SG-015: Well-known skill name impersonation ─────────────────
+
+_FRONTMATTER_NAME = re.compile(r"^---\s*\n(.*?)\n---\s*(?:\n|$)", re.DOTALL)
+_NAME_FIELD = re.compile(
+    r"""^(?:name|'name'|"name")[ \t]*:[ \t]*(?P<value>"(?:\\(?:\r\n|[\r\n])[ \t]*|\\.|[^"\\\r\n])*"|'(?:''|[^'])*'|[^\r\n]*)[ \t]*(?:#[^\r\n]*)?\r?$""",
+    re.MULTILINE,
+)
+
+
+def _parse_name_scalar(value: str) -> str:
+    """Parse a frontmatter name scalar using YAML comment and escape rules."""
+    value = value.strip()
+    if not value:
+        return ""
+
+    quote = value[0]
+    if quote not in {"'", '"'}:
+        for index, char in enumerate(value):
+            if char == "#" and (index == 0 or value[index - 1].isspace()):
+                return value[:index].rstrip()
+        return value
+
+    if quote == "'":
+        index = 1
+        decoded = []
+        while index < len(value):
+            char = value[index]
+            if char == "'":
+                if index + 1 < len(value) and value[index + 1] == "'":
+                    decoded.append("'")
+                    index += 2
+                    continue
+                trailing = value[index + 1 :].strip()
+                return "".join(decoded) if not trailing or trailing.startswith("#") else ""
+            decoded.append(char)
+            index += 1
+        return ""
+
+    escapes = {
+        "0": "\0",
+        "a": "\x07",
+        "b": "\x08",
+        "t": "\t",
+        "n": "\n",
+        "v": "\x0b",
+        "f": "\x0c",
+        "r": "\r",
+        "e": "\x1b",
+        " ": " ",
+        '"': '"',
+        "/": "/",
+        "\\": "\\",
+        "N": "\x85",
+        "_": "\xa0",
+        "L": "\u2028",
+        "P": "\u2029",
+    }
+    hex_lengths = {"x": 2, "u": 4, "U": 8}
+    decoded = []
+    index = 1
+    while index < len(value):
+        char = value[index]
+        if char == '"':
+            trailing = value[index + 1 :].strip()
+            return "".join(decoded) if not trailing or trailing.startswith("#") else ""
+        if char != "\\":
+            decoded.append(char)
+            index += 1
+            continue
+
+        index += 1
+        if index >= len(value):
+            return ""
+        escape = value[index]
+        if escape in escapes:
+            decoded.append(escapes[escape])
+            index += 1
+            continue
+        if escape in hex_lengths:
+            length = hex_lengths[escape]
+            digits = value[index + 1 : index + 1 + length]
+            if len(digits) != length or not all(
+                digit in "0123456789abcdefABCDEF" for digit in digits
+            ):
+                return ""
+            codepoint = int(digits, 16)
+            if codepoint > 0x10FFFF or 0xD800 <= codepoint <= 0xDFFF:
+                return ""
+            decoded.append(chr(codepoint))
+            index += length + 1
+            continue
+        if escape == "\n":
+            index += 1
+            while index < len(value) and value[index] in " \t":
+                index += 1
+            continue
+        if escape == "\r":
+            index += 1
+            if index < len(value) and value[index] == "\n":
+                index += 1
+            while index < len(value) and value[index] in " \t":
+                index += 1
+            continue
+        return ""
+
+    return ""
+
+
+_BLOCK_SCALAR_HEADER = re.compile(r"""[|>](?:(?:[+-][1-9]?)|(?:[1-9][+-]?))?(?:[ \t]+#.*)?""")
+
+
+def _extract_name_scalar(frontmatter: str) -> tuple[str, str]:
+    """Return the decoded name and a source-present snippet for line lookup."""
+    match = _NAME_FIELD.search(frontmatter)
+    if not match:
+        return "", ""
+
+    raw_value = match.group("value")
+    stripped_value = raw_value.strip()
+    is_block_scalar_header = bool(_BLOCK_SCALAR_HEADER.fullmatch(stripped_value))
+
+    if stripped_value and not stripped_value.startswith("#") and not is_block_scalar_header:
+        parsed_name = _parse_name_scalar(raw_value)
+        source_snippet = next(
+            (line.strip() for line in raw_value.splitlines() if line.strip()),
+            "",
+        )
+        return parsed_name, source_snippet
+
+    # Empty values may use an indented plain scalar. Block scalar headers
+    # (| or >, optionally with chomping/indent indicators) use the same
+    # indented content, but the content is literal/folded text, not a sequence.
+    remainder = frontmatter[match.end() :]
+    for line in remainder.splitlines():
+        if not line.strip():
+            continue
+        if not line[0].isspace():
+            return "", ""
+
+        scalar = line.strip()
+        if is_block_scalar_header:
+            # Block scalar content is literal text; quotes and # are not YAML
+            # scalar syntax here.
+            return scalar, scalar
+
+        # In an empty plain value, indented comment lines do not end the search.
+        if scalar.startswith("#"):
+            continue
+        if scalar.startswith("- ") or re.match(r"""^[^'"#][^:\r\n]*:[ \t]""", scalar):
+            return "", ""
+
+        parsed_name = _parse_name_scalar(scalar)
+        return parsed_name, scalar
+
+    return "", ""
+
+
+def _well_known_names() -> set[str]:
+    """Load the bundled, extendable list of legitimate skill names."""
+    names_path = Path(__file__).parent / "data" / "well_known_names.txt"
+    try:
+        return {
+            line.strip().casefold()
+            for line in names_path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+    except OSError:
+        return {
+            "clawhub",
+            "polymarket",
+            "yahoo-finance",
+            "youtube-summarize",
+            "solana-wallet-tracker",
+        }
+
+
+def _edit_distance_at_most(left: str, right: str, limit: int) -> int:
+    """Return Levenshtein distance, stopping once it exceeds the allowed limit."""
+    if abs(len(left) - len(right)) > limit:
+        return limit + 1
+    previous = list(range(len(right) + 1))
+    for i, char_left in enumerate(left, 1):
+        current = [i]
+        row_min = i
+        for j, char_right in enumerate(right, 1):
+            value = min(
+                current[j - 1] + 1,
+                previous[j] + 1,
+                previous[j - 1] + (char_left != char_right),
+            )
+            current.append(value)
+            row_min = min(row_min, value)
+        if row_min > limit:
+            return limit + 1
+        previous = current
+    return previous[-1]
+
+
+def _check_brand_name_impersonation(text: str) -> list[str]:
+    """Flag suspicious near-matches in skill frontmatter names only."""
+    frontmatter = _FRONTMATTER_NAME.match(text)
+    if not frontmatter:
+        return []
+    parsed_name, source_snippet = _extract_name_scalar(frontmatter.group(1))
+    name = parsed_name.casefold()
+    if not name or any(char.isspace() for char in name):
+        return []
+    known_names = _well_known_names()
+    if name in known_names:
+        return []
+    normalized = re.sub(r"[^a-z0-9]", "", name)
+    if not normalized:
+        return []
+    for known in known_names:
+        known_normalized = re.sub(r"[^a-z0-9]", "", known)
+        if not known_normalized:
+            continue
+        if normalized.startswith(known_normalized) and normalized[len(known_normalized) :] in {
+            "1",
+            "2",
+            "pro",
+            "official",
+            "app",
+            "ai",
+        }:
+            return [source_snippet]
+        limit = 2 if len(known_normalized) >= 8 else 1
+        if _edit_distance_at_most(normalized, known_normalized, limit) <= limit:
+            return [source_snippet]
+    return []
+
+
+RULE_BRAND_NAME_IMPERSONATION = Rule(
+    id="SG-015",
+    name="Well-known Skill Name Impersonation",
+    severity=Severity.MEDIUM,
+    description=(
+        "The skill's frontmatter name closely resembles a well-known skill name, "
+        "which may indicate impersonation or typosquatting."
+    ),
+    remediation=(
+        "Verify the publisher and source before installing. If this is an intentional "
+        "name, document the relationship or choose a distinct name."
+    ),
+    check_fn=_check_brand_name_impersonation,
+    tags=["typosquatting", "brand-impersonation", "supply-chain"],
+)
+
+
 # ── All rules ──────────────────────────────────────────────────
 
 ALL_RULES: list[Rule] = [
@@ -468,4 +907,6 @@ ALL_RULES: list[Rule] = [
     RULE_COVERT_CHANNEL,
     RULE_SOCIAL_ENG,
     RULE_SUSPICIOUS_URLS,
+    RULE_PACKAGE_REGISTRY,
+    RULE_BRAND_NAME_IMPERSONATION,
 ]

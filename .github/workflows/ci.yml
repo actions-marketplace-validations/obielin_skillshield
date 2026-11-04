@@ -9,7 +9,7 @@ jobs:
       matrix:
         python-version: ["3.10","3.11","3.12"]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
@@ -18,7 +18,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
       - uses: actions/setup-python@v7
         with: {python-version: "3.11"}
       - run: pip install -e ".[dev]"
@@ -26,5 +26,5 @@ jobs:
   claims-script:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
       - run: node --test .github/scripts/claims.test.js
